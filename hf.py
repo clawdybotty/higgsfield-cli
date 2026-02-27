@@ -434,22 +434,20 @@ class HiggsFieldClient:
             console.print(f"[red]Media upload error: {e}[/red]")
             return False
 
-    def _finalize_media_upload(self, media_id: str, filename: str) -> Optional[Dict[str, Any]]:
-        """Best-effort finalize call for uploaded media."""
+    def _finalize_media_upload(self, media_id: str, filename: str) -> bool:
+        """Finalize uploaded media so it can be referenced in generation payloads."""
         url = f"{API_BASE}/media/{media_id}/upload"
         headers = {"Authorization": f"Bearer {self.jwt}"}
         payload = {"filename": filename}
         try:
             resp = self.session.post(url, json=payload, headers=headers, timeout=30)
             if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    return data
-                return None
-            # Not all backend variants require/implement this finalize call.
-            return None
-        except Exception:
-            return None
+                return True
+            console.print(f"[red]Failed to finalize media upload: {resp.status_code} - {resp.text}[/red]")
+            return False
+        except Exception as e:
+            console.print(f"[red]Finalize upload error: {e}[/red]")
+            return False
 
     def upload_media(self, image_path: str) -> Optional[Dict[str, Any]]:
         """Upload a local image and return media metadata usable in generation params."""
@@ -480,16 +478,19 @@ class HiggsFieldClient:
             return None
 
         media_id = media.get("id")
-        if isinstance(media_id, str):
-            finalized = self._finalize_media_upload(media_id=media_id, filename=path.name)
-            if isinstance(finalized, dict):
-                # Merge any finalized metadata over original media object.
-                merged = dict(media)
-                merged.update(finalized)
-                media = merged
+        if not isinstance(media_id, str) or not media_id:
+            console.print("[red]Missing media id in upload response[/red]")
+            return None
+
+        if not self._finalize_media_upload(media_id=media_id, filename=path.name):
+            return None
 
         console.print("[green]✓ Image upload complete[/green]")
-        return media
+        return {
+            "id": media_id,
+            "type": "media_input",
+            "url": media.get("url"),
+        }
 
     def _build_conditioning_media(self, image_path: str, role: str) -> Optional[Dict[str, Any]]:
         """Upload image and return media payload entry for kling params.medias."""
@@ -498,11 +499,11 @@ class HiggsFieldClient:
             return None
 
         media_data: Dict[str, Any] = {}
-        for key in ("id", "url", "content_type"):
+        for key in ("id", "type", "url"):
             value = media.get(key)
             if value is not None:
                 media_data[key] = value
-        if not media_data:
+        if not all(k in media_data for k in ("id", "type", "url")):
             console.print("[red]Uploaded media response missing required data[/red]")
             return None
 
@@ -510,6 +511,21 @@ class HiggsFieldClient:
             "role": role,
             "data": media_data,
         }
+
+    @staticmethod
+    def _dimensions_for_aspect_ratio(aspect_ratio: str) -> tuple[int, int]:
+        """Return default output dimensions expected by kling3_0 payload."""
+        # Matches observed web payload defaults.
+        ratio = (aspect_ratio or "").strip()
+        mapping = {
+            "16:9": (1280, 720),
+            "9:16": (720, 1280),
+            "1:1": (1024, 1024),
+            "4:3": (1152, 864),
+            "3:4": (864, 1152),
+            "21:9": (1470, 630),
+        }
+        return mapping.get(ratio, (1280, 720))
     
     def generate(self, prompt: str, model: str = "z-image", width: int = 1024, 
                  height: int = 1024, aspect_ratio: str = "1:1", 
@@ -594,9 +610,13 @@ class HiggsFieldClient:
                 return None
             medias.append(end_media)
 
+        width, height = self._dimensions_for_aspect_ratio(aspect_ratio)
+
         payload = {
             "params": {
                 "prompt": prompt,
+                "width": width,
+                "height": height,
                 "aspect_ratio": aspect_ratio,
                 "mode": mode,
                 "sound": sound,
